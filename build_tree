@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# Usage: this_script [source dir] [destination dir]
+shopt -s nocasematch
+shopt -s nocaseglob
+set -e
+
+JOBS=4
+PREFIX="/tmp/boo.$$."
+
+sig_handler() {
+	local RC=$? SIG=$1
+	if [ "$RC" == "0" ] && [ "$SIG" == "EXIT" ]
+	then
+		echo OK
+	else
+		echo "Exited with status $RC"
+	fi
+	rm -rf "${PREFIX}"* || true
+	kill -s ${SIG/INT/KILL} 0
+}
+
+for sig in INT TERM EXIT
+do
+	trap "sig_handler $sig" $sig
+done
+
+
+DATE="$(which gdate 2>/dev/null || which date)"
+SPLIT="$(which gsplit 2>/dev/null || which split)"
+TOUCH="$(which gtouch 2>/dev/null || which touch)"
+FIND="$(which gfind 2>/dev/null || which find)"
+SED="$(which gsed 2>/dev/null || which sed)"
+
+if ! grep 'GNU coreutils' < <(strings "$DATE") >/dev/null
+then
+	echo "GNU date not found. Please install GNU coreutils first."
+	exit 1
+fi
+
+if ! grep 'GNU coreutils' < <(strings "$SPLIT") >/dev/null
+then
+	echo "GNU split not found. Please install GNU coreutils first."
+	exit 1
+fi
+
+if ! grep 'GNU coreutils' < <(strings "$TOUCH") >/dev/null
+then
+	echo "GNU touch not found. Please install GNU coreutils first."
+	exit 1
+fi
+
+if ! grep 'GNU findutils' < <(strings "$FIND") >/dev/null
+then
+	echo "GNU find not found. Please install GNU findutils first."
+	exit 1
+fi
+
+if ! grep 'GNU sed' < <(strings "$SED") >/dev/null
+then
+	echo "GNU sed not found. Please install it first."
+	exit 1
+fi
+
+if ! which openssl >/dev/null 2>&1
+then
+	echo "OpenSSL not found. Please install it first."
+	exit 1
+fi
+
+if ! which exiftool >/dev/null 2>&1
+then
+	echo "ExitTool not found. Please download it from http://www.sno.phy.queensu.ca/~phil/exiftool/ and install it first."
+	exit 1
+fi
+
+HAS_JPEGTRAN=0
+if which jpegtran >/dev/null 2>&1
+then
+	HAS_JPEGTRAN=1
+fi
+
+UNSORTED=$(cd "${1:-.}"; pwd)
+DEST_ROOT=$(D="${2:-.}"; mkdir -p "$D"; cd "$D"; pwd)
+
+echo "Will merge $UNSORTED"
+echo "Into tree at $DEST_ROOT"
+
+if [ "$UNSORTED" == "$DEST_ROOT" ]
+then
+	echo >&2 "Source and destination directories cannot be the same."
+	echo >&2 "Usage: $0 [source dir] [destination dir]"
+	exit 1
+fi
+
+echo "* Updating state folder... "
+cd "$DEST_ROOT"
+mkdir -p ".state"/{refs,hashs}
+while IFS= read -r -d '' FN
+do
+	D="${FN%/*}"
+
+	# Remove leading ./
+	D="${D:2}"
+	FN="${FN:2}"
+
+	[ -d ".state/refs/$D" ] || mkdir -p ".state/refs/$D"
+	if [ ! -f ".state/refs/$FN" ]
+	then
+		echo "Found $FN"
+		SIG=$(openssl dgst -ripemd160 "$FN")
+		SIG=${SIG/*= /}
+		echo -n $FN > ".state/hashs/$SIG"
+		echo -n $SIG > ".state/refs/$FN"
+	fi
+done < <($FIND -O3 . -path ./.state -prune -o -type f -readable -print0)
+
+echo
+echo "* Merging $UNSORTED"
+cd "$UNSORTED"
+
+function process_list() {
+	local JOB="$1"
+	local FN
+	while IFS= read -r -d '' FN
+	do
+		# Remove leading ./
+		local FN="${FN:2}"
+		local BASE=${FN##*/}
+		local EXT="${FN##*.}"
+
+		# Build signature (using the original file)
+		local SIG=$(openssl dgst -ripemd160 "$FN")
+		SIG=${SIG/*= /}
+		if [ -f "${DEST_ROOT}/.state/hashs/$SIG" ]
+		then
+			local DUPE="$(cat "${DEST_ROOT}/.state/hashs/$SIG" || true)"
+			echo "$FN == ${DEST_ROOT}/$DUPE"
+			if [ ! -z "$DUPE" ] && [ -f "${DEST_ROOT}/$DUPE" ]
+			then
+				rm "$FN"
+				continue
+			fi
+		fi
+
+		# Optimize photo
+		# FIXME: Disabled for now, as jpegtran doesn't preserve mtime
+		if false && [ "${EXT^^}" == "JPG" ] && ((HAS_JPEGTRAN))
+		then
+			local TMP_FILE="${PREFIX}pic${JOB}.jpg"
+			if jpegtran -optimize -perfect -copy all -outfile "$TMP_FILE" "$FN" >/dev/null 2>&1
+			then
+				exiftool -P -overwrite_original -ifd1:all= -PreviewImage= "$TMP_FILE" >/dev/null || true
+				FN="$TMP_FILE"
+			fi
+		fi
+
+		# MPG files sometimes have a companion THM file holding the metadata
+		local F2="${FN}"
+		if [ -f "${FN%.*}.THM" ] && [ "${EXT^^}" == "MPG" ]
+		then
+			F2="${FN%.*}.THM"
+		fi
+		# EXIF
+		local LINE
+		unset TAGS
+		local -A TAGS
+		while read -r LINE
+		do
+			TAGS["${LINE%%=*}"]="${LINE#*=}"
+		done < <(exiftool -S -d '%Y-%m-%dT%H:%M:%S%z' -DateTimeOriginal -MediaCreateDate -MediaModifyDate -TrackCreateDate -TrackModifyDate -Creationdate -CreateDate -ModifyDate -FileModifyDate "$F2" | $SED -e 's#\([^:]\+\): *\(.*\)#\1=\2#g' -e 's#^\([^=]\+\)=\(.\+[^-+]....\)$#\1=\2+0900#g')
+
+		local D=""
+		for T in CreateDate Creationdate DateTimeOriginal ModifyDate MediaCreateDate MediaModifyDate TrackCreateDate TrackModifyDate FileModifyDate
+		do
+			if [ ! -z "${TAGS[$T]}" ]
+			then
+				D="$($DATE -ud "${TAGS[$T]}" +'%Y/%m/%d' 2>/dev/null || true)"
+				if [ ! -z "$D" ]
+				then
+					break
+				fi
+			fi
+		done
+
+		if [ -z "$D" ]
+		then
+			echo >&2 "Unable to find EXIF date for $F2 (skipping)"
+			continue
+		fi
+
+		mkdir -p "${DEST_ROOT}/$D"
+		while [ -f "${DEST_ROOT}/$D/$BASE" ]
+		do
+			# Names might collide if multiple cameras were used
+			BASE="${BASE%.*}_.$EXT"
+		done
+		$TOUCH -d "$Z" "$FN"
+		mv -v "$FN" "${DEST_ROOT}/$D/$BASE"
+
+		[ -d "${DEST_ROOT}/.state/refs/$D" ] || mkdir -p "${DEST_ROOT}/.state/refs/$D"
+		FN="$D/$BASE"
+		echo -n $FN > "${DEST_ROOT}/.state/hashs/$SIG"
+		echo -n $SIG > "${DEST_ROOT}/.state/refs/$FN"
+	done < <(tr '\n' '\0' <"${PREFIX}$JOB")
+}
+
+# FIXME: Find a better way to split files into jobs
+LIST="${PREFIX}txt"
+$SPLIT \
+	--number="r/$JOBS" \
+	--elide-empty-files \
+	--numeric-suffixes=1 \
+	--suffix-length=1 \
+	- "$PREFIX" \
+	< <($FIND -O3 . -regextype posix-extended -type f -readable -iregex '.*\.(3gp|avi|mpeg|mpg|mp2|m2v|m4v|mp4|jpg|mov|nef|png)' -print)
+
+unset pid
+for (( N=1; N<=$JOBS; ++N ))
+do
+	if [ -f "${PREFIX}$N" ]
+	then
+		process_list $N &
+		pid[${#pid[*]}]=$!
+	fi
+done
+wait ${pid[@]}
+echo "Done!"
