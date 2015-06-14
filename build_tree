@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/opt/local/bin/bash
 # Usage: this_script [source dir] [destination dir]
 shopt -s nocasematch
 shopt -s nocaseglob
@@ -106,7 +106,7 @@ function manager() {
 		--numeric-suffixes=1 \
 		--suffix-length=1 \
 		- "${J}/boo." \
-		< <("$FIND" -O3 . -path ./.state -prune -o -regextype posix-extended -type f -readable -iregex '.*\.(3gp|avi|mpeg|mpg|mp2|m2v|m4v|mp4|jpg|mov|nef|png)' -print)
+		< <("$FIND" -O3 . -path ./.state -prune -o -regextype posix-extended -type f -readable -iregex '.*\.(3gp|avi|mpeg|mpg|mp2|m2v|m4v|mp4|jpg|mov|nef|png|xcf|psd|pdf|odt|svg|gif)' -print)
 
 	local -a pid
 	local N
@@ -175,13 +175,15 @@ function process_file() {
 	done < <(exiftool -S -d '%Y-%m-%dT%H:%M:%S%z' -DateTimeOriginal -MediaCreateDate -MediaModifyDate -TrackCreateDate -TrackModifyDate -Creationdate -CreateDate -ModifyDate -FileModifyDate "$F2" | "$SED" -e 's#\([^:]\+\): *\(.*\)#\1=\2#g' -e 's#^\([^=]\+\)=\(.\+[^-+]....\)$#\1=\2+0900#g')
 
 	local D=""
-	for T in CreateDate Creationdate DateTimeOriginal ModifyDate MediaCreateDate MediaModifyDate TrackCreateDate TrackModifyDate FileModifyDate
+	local Z=""
+	for T in CreateDate Creationdate DateTimeOriginal ModifyDate MediaCreateDate MediaModifyDate TrackCreateDate TrackModifyDate
 	do
 		if [ ! -z "${TAGS[$T]}" ]
 		then
 			D="$("$DATE" -ud "${TAGS[$T]}" +'%Y/%m/%d' 2>/dev/null || true)"
 			if [ ! -z "$D" ]
 			then
+				Z="$("$DATE" -ud "${TAGS[$T]}" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
 				break
 			fi
 		fi
@@ -189,8 +191,21 @@ function process_file() {
 
 	if [ -z "$D" ]
 	then
-		echo >&2 "Unable to find EXIF date for $F2 (skipping)"
-		continue
+		# If it's already in a folder that looks like a date, take that
+		local D2="${F2%/*}"
+		if [ "$D2" != "$F2" ]
+		then
+			if [[ "$D2" =~ (^|/)([0-9]{4}/[0-9]{2}/[0-9]{2}$) ]]
+			then
+				D="${BASH_REMATCH[2]}"
+			fi
+		fi
+	fi
+
+	if [ -z "$D" ]
+	then
+		echo >&2 "Unable to find EXIF date for $F2"
+		D="unsorted"
 	fi
 
 	mkdir -p "${DEST_ROOT}/$D"
@@ -202,10 +217,15 @@ function process_file() {
 	done
 
 	local NEW_FN="${DEST_ROOT}/$D/$BASE2"
-	mv -v "$FN" "$NEW_FN"
+	ln -fv "$FN" "$NEW_FN"
+	# Copy additional metadata
+	[ ! -f "${FN%.*}.THM" ] || ln -fv "${FN%.*}.THM" "${NEW_FN%.*}.THM"
+	[ ! -f "${FN%.*}.XMP" ] || ln -fv "${FN%.*}.XMP" "${NEW_FN%.*}.XMP"
+	[ ! -f "${FN%.*}.AAE" ] || ln -fv "${FN%.*}.AAE" "${NEW_FN%.*}.AAE"
+
 	chown "$USER" "$NEW_FN"
 	chmod 644 "$NEW_FN"
-	"$TOUCH" -d "$Z" "$NEW_FN"
+	[ -z "$Z" ] || "$TOUCH" -d "$Z" "$NEW_FN"
 
 	[ -d "${DEST_ROOT}/.state/refs/$D" ] || mkdir -p "${DEST_ROOT}/.state/refs/$D"
 	echo -n "$D/$BASE2" > "${DEST_ROOT}/.state/hashs/$SIG"
